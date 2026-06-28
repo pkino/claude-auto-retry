@@ -7,8 +7,30 @@ export function buildCaptureArgs(pane, lines = 200) {
   return ['capture-pane', '-t', pane, '-p', '-S', `-${lines}`];
 }
 
+// Submit delay: when sending a message to a TUI like Claude Code (Ink-based),
+// the text and the submitting Enter must be sent as TWO separate tmux send-keys
+// calls with a brief pause between them. Without the pause, Ink on Linux often:
+//   - interprets the Enter as a newline within a bracketed-paste burst and just
+//     inserts "\n" into the input box instead of submitting (most common case)
+//   - or processes the Enter before React reconciliation has incorporated the
+//     text into input state, dropping the submit
+// 150ms is empirically reliable across Linux + macOS for Claude Code.
+export const SUBMIT_DELAY_MS = 150;
+
+// Single-call form. Kept for callers / tests that want the legacy shape; the
+// production sendKeys() below uses the split form for reliability.
 export function buildSendKeysArgs(pane, text) {
   return ['send-keys', '-t', pane, text, 'Enter'];
+}
+
+// Split form: text-only (no Enter).
+export function buildSendTextArgs(pane, text) {
+  return ['send-keys', '-t', pane, text];
+}
+
+// Split form: bare Enter.
+export function buildSendEnterArgs(pane) {
+  return ['send-keys', '-t', pane, 'Enter'];
 }
 
 export function buildDisplayArgs(pane, format) {
@@ -32,7 +54,10 @@ export async function capturePane(pane, lines = 200) {
 }
 
 export async function sendKeys(pane, text) {
-  await execFileAsync('tmux', buildSendKeysArgs(pane, text));
+  // Submit-to-TUI in two steps. See SUBMIT_DELAY_MS for why.
+  await execFileAsync('tmux', buildSendTextArgs(pane, text));
+  await new Promise(r => setTimeout(r, SUBMIT_DELAY_MS));
+  await execFileAsync('tmux', buildSendEnterArgs(pane));
 }
 
 export async function getPaneCommand(pane) {

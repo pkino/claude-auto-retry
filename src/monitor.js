@@ -6,8 +6,27 @@ import { createLogger } from './logger.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 
+// Claude Code shows "esc to interrupt" while it is actively generating. Used to
+// tell a genuinely-resumed/busy session apart from an idle one whose rate-limit
+// banner simply cleared once the limit reset.
+const BUSY_REGEX = /esc to interrupt/i;
+function isClaudeBusy(text) {
+  return BUSY_REGEX.test(text);
+}
+
+// Signature of the bottom of the pane — used to detect whether Claude has
+// actually started responding after we sent a retry message. The rate-limit
+// message lingers in the TUI scrollback even after Claude resumes, so
+// re-running isRateLimited() can keep returning true and produce redundant
+// retries. A change in the bottom 5 non-blank lines is a much more reliable
+// "Claude is alive again" signal.
+function paneSignature(stripped) {
+  const lines = stripped.split('\n').map(l => l.trimEnd()).filter(l => l.length > 0);
+  return lines.slice(-5).join('\n');
+}
+
 export function createMonitorState() {
-  return { status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null };
+  return { status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null, _sigBeforeSend: null };
 }
 
 export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) {
@@ -20,11 +39,29 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
     if (Date.now() < state.waitUntil) return 'waiting';
     if (!isAlive()) return 'exit';
 
-    // Always check if rate limit cleared FIRST — even when maxRetries
-    // exhausted, the user (or time passing) may have resolved it.
-    if (!isRateLimited(stripped, config.customPatterns)) {
-      state.status = 'monitoring'; state.attempts = 0;
+    // After we've sent at least one retry, prefer the "pane moved" signal over
+    // re-pattern-matching the rate-limit text. The limit message stays in
+    // scrollback after Claude resumes, so isRateLimited() would keep returning
+    // true and the loop would resend the retry message every 30s.
+    if (state._sigBeforeSend && paneSignature(stripped) !== state._sigBeforeSend) {
+      state.status = 'monitoring';
+      state.attempts = 0;
+      state._sigBeforeSend = null;
       return 'user-continued';
+    }
+
+    // Rate-limit banner no longer visible. This does NOT reliably mean the user
+    // resumed: Claude clears the banner once the limit resets, so it is usually
+    // absent exactly when we should send the retry. Only treat it as
+    // user-continued when Claude looks busy (actively generating) or when the
+    // behaviour is explicitly disabled via config. Otherwise fall through and
+    // send the retry to resume the idle session.
+    if (!isRateLimited(stripped, config.customPatterns)) {
+      if (config.retryOnExpiryWhenCleared === false || isClaudeBusy(stripped)) {
+        state.status = 'monitoring'; state.attempts = 0;
+        state._sigBeforeSend = null;
+        return 'user-continued';
+      }
     }
 
     if (state.attempts >= config.maxRetries) {
@@ -52,6 +89,9 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
 
     // Increment attempts and set cooldown BEFORE sendKeys so that a failure
     // (e.g. pane destroyed) still consumes a retry and avoids tight-loop errors.
+    // Snapshot the pane signature before sending so the next tick can detect
+    // whether Claude actually started responding (vs. our retry being eaten).
+    state._sigBeforeSend = paneSignature(stripped);
     state.attempts++;
     state.waitUntil = Date.now() + 30_000;
     await tmuxAdapter.sendKeys(pane, config.retryMessage);
@@ -60,9 +100,21 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
 
   if (isRateLimited(stripped, config.customPatterns)) {
     const message = findRateLimitMessage(stripped, config.customPatterns);
-    state.lastRateLimitMessage = message;
     const parsed = message ? parseResetTime(message) : null;
-    state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+    const waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+
+    // Stale-message guard: if an absolute reset time is already in the past,
+    // calculateWaitMs adds 24h and returns ~next-day waiting. That's almost
+    // never what we want — the Claude TUI keeps old "resets HH:MMam" lines in
+    // scrollback, and treating them as "tomorrow" makes the monitor sleep
+    // through the actual fresh rate limit. If the wait is suspiciously close to
+    // a full day, stay in monitoring and re-check on the next tick.
+    if (waitMs > 22 * 3600 * 1000) {
+      return 'monitoring';
+    }
+
+    state.lastRateLimitMessage = message;
+    state.waitUntil = Date.now() + waitMs;
     state.status = 'waiting';
     return 'waiting';
   }
