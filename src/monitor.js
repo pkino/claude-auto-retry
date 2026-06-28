@@ -1,13 +1,49 @@
 import { stripAnsi, isRateLimited, findRateLimitMessage } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
-import { capturePane, sendKeys, getPaneCommand, isProcessForeground } from './tmux.js';
+import { capturePane, sendKeys, sendEscape, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 
+// Heuristics for "Claude is actively working". The rate-limit text can linger
+// in scrollback after Claude resumes, so we need a positive "busy" signal to
+// avoid (a) treating stale limit text as a fresh limit and (b) firing a retry
+// into a session that is already running. Covers the "esc to interrupt" hint,
+// Claude Code's whimsical spinner verbs, "thinking" states, and live token
+// counters. (busy verb/token patterns adapted from PR #17)
+function isClaudeBusy(text) {
+  return /esc to interrupt/i.test(text)
+    || /\b(?:Herding|Booping|Cooking|Brewing|Brewed|Sautéing|Sauteing|Simmering|Percolating|Conjuring|Forging|Noodling|Pondering)\b/i.test(text)
+    || /still thinking/i.test(text)
+    || /thinking (?:with|more|hard|.*effort)/i.test(text)
+    || /\([^)]*tokens\)/i.test(text);
+}
+
+// Claude Code's newer interactive /rate-limit-options menu. Pressing Enter here
+// confirms the highlighted option, which on some builds defaults to "Upgrade
+// your plan" (Issue #19) — a paid action. We therefore dismiss the menu with
+// Escape instead and fall back to the normal wait-then-retry flow.
+function isRateLimitOptionsPrompt(text) {
+  return /\/rate-limit-options/i.test(text)
+    && /What do you want to do\?/i.test(text)
+    && /Stop and wait for limit to reset/i.test(text)
+    && /Enter to confirm/i.test(text);
+}
+
+// Signature of the bottom of the pane — used to detect whether Claude has
+// actually started responding after we sent a retry message. The rate-limit
+// message lingers in the TUI scrollback even after Claude resumes, so
+// re-running isRateLimited() can keep returning true and produce redundant
+// retries. A change in the bottom 5 non-blank lines is a much more reliable
+// "Claude is alive again" signal.
+function paneSignature(stripped) {
+  const lines = stripped.split('\n').map(l => l.trimEnd()).filter(l => l.length > 0);
+  return lines.slice(-5).join('\n');
+}
+
 export function createMonitorState() {
-  return { status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null };
+  return { status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null, _sigBeforeSend: null, _menuHandled: false };
 }
 
 export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) {
@@ -16,15 +52,58 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
   const raw = await tmuxAdapter.capturePane(pane, 20);
   const stripped = stripAnsi(raw);
 
+  // Interactive /rate-limit-options menu. Dismiss with Escape (never confirm a
+  // possibly-highlighted "Upgrade your plan") and enter the normal wait flow so
+  // the retry is sent after the limit resets. (Issue #19)
+  if (isRateLimitOptionsPrompt(stripped)) {
+    if (!state._menuHandled) {
+      const message = findRateLimitMessage(stripped, config.customPatterns);
+      const parsed = message ? parseResetTime(message) : null;
+      state.lastRateLimitMessage = message;
+      state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+      state.status = 'waiting';
+      state._menuHandled = true;
+      await tmuxAdapter.sendEscape(pane);
+      return 'dismissed-rate-limit-menu';
+    }
+    return state.status === 'waiting' ? 'waiting' : 'monitoring';
+  }
+  state._menuHandled = false;
+
   if (state.status === 'waiting') {
     if (Date.now() < state.waitUntil) return 'waiting';
     if (!isAlive()) return 'exit';
 
-    // Always check if rate limit cleared FIRST — even when maxRetries
-    // exhausted, the user (or time passing) may have resolved it.
-    if (!isRateLimited(stripped, config.customPatterns)) {
-      state.status = 'monitoring'; state.attempts = 0;
+    // Claude is actively working again — its rate-limit line may just be stale
+    // scrollback. Treat this as resumed and never fire a retry into a live run.
+    if (isClaudeBusy(stripped)) {
+      state.status = 'monitoring'; state.attempts = 0; state._sigBeforeSend = null;
       return 'user-continued';
+    }
+
+    // After we've sent at least one retry, prefer the "pane moved" signal over
+    // re-pattern-matching the rate-limit text. The limit message stays in
+    // scrollback after Claude resumes, so isRateLimited() would keep returning
+    // true and the loop would resend the retry message every 30s.
+    if (state._sigBeforeSend && paneSignature(stripped) !== state._sigBeforeSend) {
+      state.status = 'monitoring';
+      state.attempts = 0;
+      state._sigBeforeSend = null;
+      return 'user-continued';
+    }
+
+    // Rate-limit banner no longer visible. This does NOT reliably mean the user
+    // resumed: Claude clears the banner once the limit resets, so it is usually
+    // absent exactly when we should send the retry. Only treat it as
+    // user-continued when Claude looks busy (actively generating) or when the
+    // behaviour is explicitly disabled via config. Otherwise fall through and
+    // send the retry to resume the idle session.
+    if (!isRateLimited(stripped, config.customPatterns)) {
+      if (config.retryOnExpiryWhenCleared === false || isClaudeBusy(stripped)) {
+        state.status = 'monitoring'; state.attempts = 0;
+        state._sigBeforeSend = null;
+        return 'user-continued';
+      }
     }
 
     if (state.attempts >= config.maxRetries) {
@@ -52,17 +131,32 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
 
     // Increment attempts and set cooldown BEFORE sendKeys so that a failure
     // (e.g. pane destroyed) still consumes a retry and avoids tight-loop errors.
+    // Snapshot the pane signature before sending so the next tick can detect
+    // whether Claude actually started responding (vs. our retry being eaten).
+    state._sigBeforeSend = paneSignature(stripped);
     state.attempts++;
     state.waitUntil = Date.now() + 30_000;
     await tmuxAdapter.sendKeys(pane, config.retryMessage);
     return 'retried';
   }
 
-  if (isRateLimited(stripped, config.customPatterns)) {
+  if (!isClaudeBusy(stripped) && isRateLimited(stripped, config.customPatterns)) {
     const message = findRateLimitMessage(stripped, config.customPatterns);
-    state.lastRateLimitMessage = message;
     const parsed = message ? parseResetTime(message) : null;
-    state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+    const waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+
+    // Stale-message guard: if an absolute reset time is already in the past,
+    // calculateWaitMs adds 24h and returns ~next-day waiting. That's almost
+    // never what we want — the Claude TUI keeps old "resets HH:MMam" lines in
+    // scrollback, and treating them as "tomorrow" makes the monitor sleep
+    // through the actual fresh rate limit. If the wait is suspiciously close to
+    // a full day, stay in monitoring and re-check on the next tick.
+    if (waitMs > 22 * 3600 * 1000) {
+      return 'monitoring';
+    }
+
+    state.lastRateLimitMessage = message;
+    state.waitUntil = Date.now() + waitMs;
     state.status = 'waiting';
     return 'waiting';
   }
@@ -79,7 +173,7 @@ export async function startMonitor(pane, pid) {
 
   await logger.info(`Monitor started for pane ${pane} (claude PID: ${pid})`);
 
-  const tmuxAdapter = { capturePane, sendKeys, getPaneCommand, isClaudeForeground: () => isProcessForeground(pid) };
+  const tmuxAdapter = { capturePane, sendKeys, sendEscape, getPaneCommand, isClaudeForeground: () => isProcessForeground(pid) };
   const isAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
   const loop = async () => {
@@ -93,6 +187,7 @@ export async function startMonitor(pane, pid) {
         await logger.info(`Rate limit detected: "${state.lastRateLimitMessage}". Waiting ${secs}s...`);
         state.lastRateLimitMessage = null;
       }
+      if (result === 'dismissed-rate-limit-menu') await logger.info('Dismissed Claude /rate-limit-options menu (Escape) and entered wait. Will retry after reset.');
       if (result === 'retried') await logger.info(`Sent retry message (attempt ${state.attempts})`);
       if (result === 'user-continued') await logger.info('User already continued. Attempt counter reset.');
       if (result === 'max-retries') await logger.warn(`Max retries (${config.maxRetries}) reached. Monitor still active but will not send further retries until rate limit clears.`);

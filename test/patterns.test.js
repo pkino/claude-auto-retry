@@ -54,6 +54,9 @@ describe('isRateLimited', () => {
   it('detects "You\'ve hit your limit" (real Claude Code message)', () => {
     assert.equal(isRateLimited("You've hit your limit · resets 3pm (Asia/Tbilisi)"), true);
   });
+  it('detects "You\'ve hit your session limit" (new Claude Code message)', () => {
+    assert.equal(isRateLimited("You've hit your session limit · resets 4:40am (Asia/Tokyo)"), true);
+  });
   it('detects "hit the limit resets"', () => {
     assert.equal(isRateLimited('You hit the limit. Resets at 5pm'), true);
   });
