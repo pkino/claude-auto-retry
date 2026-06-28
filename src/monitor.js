@@ -1,17 +1,34 @@
 import { stripAnsi, isRateLimited, findRateLimitMessage } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
-import { capturePane, sendKeys, getPaneCommand, isProcessForeground } from './tmux.js';
+import { capturePane, sendKeys, sendEscape, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 
-// Claude Code shows "esc to interrupt" while it is actively generating. Used to
-// tell a genuinely-resumed/busy session apart from an idle one whose rate-limit
-// banner simply cleared once the limit reset.
-const BUSY_REGEX = /esc to interrupt/i;
+// Heuristics for "Claude is actively working". The rate-limit text can linger
+// in scrollback after Claude resumes, so we need a positive "busy" signal to
+// avoid (a) treating stale limit text as a fresh limit and (b) firing a retry
+// into a session that is already running. Covers the "esc to interrupt" hint,
+// Claude Code's whimsical spinner verbs, "thinking" states, and live token
+// counters. (busy verb/token patterns adapted from PR #17)
 function isClaudeBusy(text) {
-  return BUSY_REGEX.test(text);
+  return /esc to interrupt/i.test(text)
+    || /\b(?:Herding|Booping|Cooking|Brewing|Brewed|Sautéing|Sauteing|Simmering|Percolating|Conjuring|Forging|Noodling|Pondering)\b/i.test(text)
+    || /still thinking/i.test(text)
+    || /thinking (?:with|more|hard|.*effort)/i.test(text)
+    || /\([^)]*tokens\)/i.test(text);
+}
+
+// Claude Code's newer interactive /rate-limit-options menu. Pressing Enter here
+// confirms the highlighted option, which on some builds defaults to "Upgrade
+// your plan" (Issue #19) — a paid action. We therefore dismiss the menu with
+// Escape instead and fall back to the normal wait-then-retry flow.
+function isRateLimitOptionsPrompt(text) {
+  return /\/rate-limit-options/i.test(text)
+    && /What do you want to do\?/i.test(text)
+    && /Stop and wait for limit to reset/i.test(text)
+    && /Enter to confirm/i.test(text);
 }
 
 // Signature of the bottom of the pane — used to detect whether Claude has
@@ -26,7 +43,7 @@ function paneSignature(stripped) {
 }
 
 export function createMonitorState() {
-  return { status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null, _sigBeforeSend: null };
+  return { status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null, _sigBeforeSend: null, _menuHandled: false };
 }
 
 export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) {
@@ -35,9 +52,34 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
   const raw = await tmuxAdapter.capturePane(pane, 20);
   const stripped = stripAnsi(raw);
 
+  // Interactive /rate-limit-options menu. Dismiss with Escape (never confirm a
+  // possibly-highlighted "Upgrade your plan") and enter the normal wait flow so
+  // the retry is sent after the limit resets. (Issue #19)
+  if (isRateLimitOptionsPrompt(stripped)) {
+    if (!state._menuHandled) {
+      const message = findRateLimitMessage(stripped, config.customPatterns);
+      const parsed = message ? parseResetTime(message) : null;
+      state.lastRateLimitMessage = message;
+      state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+      state.status = 'waiting';
+      state._menuHandled = true;
+      await tmuxAdapter.sendEscape(pane);
+      return 'dismissed-rate-limit-menu';
+    }
+    return state.status === 'waiting' ? 'waiting' : 'monitoring';
+  }
+  state._menuHandled = false;
+
   if (state.status === 'waiting') {
     if (Date.now() < state.waitUntil) return 'waiting';
     if (!isAlive()) return 'exit';
+
+    // Claude is actively working again — its rate-limit line may just be stale
+    // scrollback. Treat this as resumed and never fire a retry into a live run.
+    if (isClaudeBusy(stripped)) {
+      state.status = 'monitoring'; state.attempts = 0; state._sigBeforeSend = null;
+      return 'user-continued';
+    }
 
     // After we've sent at least one retry, prefer the "pane moved" signal over
     // re-pattern-matching the rate-limit text. The limit message stays in
@@ -98,7 +140,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
     return 'retried';
   }
 
-  if (isRateLimited(stripped, config.customPatterns)) {
+  if (!isClaudeBusy(stripped) && isRateLimited(stripped, config.customPatterns)) {
     const message = findRateLimitMessage(stripped, config.customPatterns);
     const parsed = message ? parseResetTime(message) : null;
     const waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
@@ -131,7 +173,7 @@ export async function startMonitor(pane, pid) {
 
   await logger.info(`Monitor started for pane ${pane} (claude PID: ${pid})`);
 
-  const tmuxAdapter = { capturePane, sendKeys, getPaneCommand, isClaudeForeground: () => isProcessForeground(pid) };
+  const tmuxAdapter = { capturePane, sendKeys, sendEscape, getPaneCommand, isClaudeForeground: () => isProcessForeground(pid) };
   const isAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
   const loop = async () => {
@@ -145,6 +187,7 @@ export async function startMonitor(pane, pid) {
         await logger.info(`Rate limit detected: "${state.lastRateLimitMessage}". Waiting ${secs}s...`);
         state.lastRateLimitMessage = null;
       }
+      if (result === 'dismissed-rate-limit-menu') await logger.info('Dismissed Claude /rate-limit-options menu (Escape) and entered wait. Will retry after reset.');
       if (result === 'retried') await logger.info(`Sent retry message (attempt ${state.attempts})`);
       if (result === 'user-continued') await logger.info('User already continued. Attempt counter reset.');
       if (result === 'max-retries') await logger.warn(`Max retries (${config.maxRetries}) reached. Monitor still active but will not send further retries until rate limit clears.`);

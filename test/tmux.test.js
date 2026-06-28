@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCaptureArgs, buildSendKeysArgs, buildSendTextArgs, buildSendEnterArgs, buildDisplayArgs, parseTmuxVersion, SUBMIT_DELAY_MS } from '../src/tmux.js';
+import { buildCaptureArgs, buildSendKeysArgs, buildSendTextArgs, buildSendEnterArgs, buildSendEscapeArgs, buildDisplayArgs, parseTmuxVersion, SUBMIT_DELAY_MS } from '../src/tmux.js';
 
 describe('buildCaptureArgs', () => {
   it('builds correct args', () => {
@@ -24,6 +24,12 @@ describe('buildSendEnterArgs', () => {
   it('builds bare-Enter send-keys args', () => {
     assert.deepEqual(buildSendEnterArgs('%3'),
       ['send-keys', '-t', '%3', 'Enter']);
+  });
+});
+describe('buildSendEscapeArgs', () => {
+  it('builds bare-Escape send-keys args', () => {
+    assert.deepEqual(buildSendEscapeArgs('%3'),
+      ['send-keys', '-t', '%3', 'Escape']);
   });
 });
 describe('SUBMIT_DELAY_MS', () => {

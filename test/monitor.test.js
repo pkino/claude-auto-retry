@@ -6,9 +6,11 @@ import { DEFAULT_CONFIG } from '../src/config.js';
 function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = true) {
   const t = {
     _sent: [],
+    _escapes: 0,
     capturePane: async () => paneContent,
     getPaneCommand: async () => paneCommand,
     sendKeys: async (_p, text) => { t._sent.push(text); },
+    sendEscape: async () => { t._escapes++; },
     isClaudeForeground: async () => claudeForeground,
   };
   return t;
@@ -143,6 +145,57 @@ describe('processOneTick', () => {
     assert.equal(await processOneTick(s, t, '%0', config, () => true), 'user-continued');
     assert.equal(t._sent.length, 0);
   });
+  // --- Issue #19: interactive /rate-limit-options menu ---
+  it('dismisses the /rate-limit-options menu with Escape (never confirms upgrade)', async () => {
+    const text = [
+      "⎿  You've hit your session limit · resets 12:10am (Europe/Dublin)",
+      '/rate-limit-options',
+      'What do you want to do?',
+      '❯ 1. Upgrade your plan',          // upgrade highlighted as default!
+      '  2. Stop and wait for limit to reset',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n');
+    const t = mockTmux(text);
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'dismissed-rate-limit-menu');
+    assert.equal(t._escapes, 1, 'sent Escape');
+    assert.equal(t._sent.length, 0, 'never pressed Enter into the menu');
+    assert.equal(s.status, 'waiting');
+    assert.ok(s.waitUntil > Date.now());
+  });
+  it('does not re-dismiss the same menu every tick', async () => {
+    const text = [
+      "You've hit your session limit · resets 12:10am (Europe/Dublin)",
+      '/rate-limit-options',
+      'What do you want to do?',
+      '❯ 1. Stop and wait for limit to reset',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n');
+    const t = mockTmux(text);
+    const s = createMonitorState();
+    await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true);
+    const r2 = await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true);
+    assert.equal(t._escapes, 1, 'Escape sent only once for the same menu');
+    assert.equal(r2, 'waiting');
+  });
+
+  // --- busy detection (stale rate-limit text while Claude is working) ---
+  it('ignores stale rate-limit text while Claude is visibly thinking', async () => {
+    const t = mockTmux('5-hour limit reached - resets 3pm (UTC)\n· Herding… (3m · thinking with xhigh effort)');
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'monitoring');
+    assert.equal(t._sent.length, 0);
+  });
+  it('clears waiting state when Claude is visibly busy after a retry', async () => {
+    const t = mockTmux('5-hour limit reached - resets 3pm (UTC)\n✽ Booping… (1m 43s · ↓ 5.6k tokens)');
+    const s = createMonitorState();
+    s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 1;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+    assert.equal(s.status, 'monitoring');
+    assert.equal(s.attempts, 0);
+    assert.equal(t._sent.length, 0);
+  });
+
   it('does not over-wait ~24h on a stale past reset time', async () => {
     // A lingering "resets 12:20am" line whose time already passed would make
     // calculateWaitMs add 24h. The guard keeps us monitoring instead.

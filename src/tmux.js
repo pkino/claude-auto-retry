@@ -33,6 +33,12 @@ export function buildSendEnterArgs(pane) {
   return ['send-keys', '-t', pane, 'Enter'];
 }
 
+// Bare Escape — used to dismiss the interactive /rate-limit-options menu
+// without ever confirming a (possibly highlighted) "Upgrade your plan" option.
+export function buildSendEscapeArgs(pane) {
+  return ['send-keys', '-t', pane, 'Escape'];
+}
+
 export function buildDisplayArgs(pane, format) {
   return ['display-message', '-t', pane, '-p', format];
 }
@@ -58,6 +64,10 @@ export async function sendKeys(pane, text) {
   await execFileAsync('tmux', buildSendTextArgs(pane, text));
   await new Promise(r => setTimeout(r, SUBMIT_DELAY_MS));
   await execFileAsync('tmux', buildSendEnterArgs(pane));
+}
+
+export async function sendEscape(pane) {
+  await execFileAsync('tmux', buildSendEscapeArgs(pane));
 }
 
 export async function getPaneCommand(pane) {
