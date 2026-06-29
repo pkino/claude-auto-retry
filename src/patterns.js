@@ -27,6 +27,7 @@ const LIMIT_PATTERNS = [
   /\d+-hour limit/i,                                // "5-hour limit"
   /limit reached/i,                                  // "limit reached"
   /usage limit/i,                                    // "usage limit"
+  /\d+%\s+of your\s+(?:\w+\s+)?limit/i,              // "used 100% of your session limit" / "89% of your weekly limit"
   /out of.*usage/i,                                  // "out of extra usage"
   /rate limit/i,                                     // "rate limit"
   /try again in/i,                                   // "try again in X hours" (implies rate limiting)

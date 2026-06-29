@@ -195,6 +195,16 @@ describe('processOneTick', () => {
     assert.equal(s.attempts, 0);
     assert.equal(t._sent.length, 0);
   });
+  it('treats the "✻ Brewed for ..." completion marker as idle, not busy (regression)', async () => {
+    // Claude Code's completion line "✻ Brewed for 1m 56s" lingers at the bottom
+    // of the pane after work finishes. "Brewed" used to match the busy verb list,
+    // so the monitor read the pane as permanently busy and never detected the
+    // rate limit. It must now be treated as idle so the limit IS detected.
+    const t = mockTmux("You've used 100% of your session limit · resets 12:10am (Asia/Tokyo)\n✻ Brewed for 1m 56s");
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+    assert.ok(s.waitUntil > Date.now());
+  });
 
   it('does not over-wait ~24h on a stale past reset time', async () => {
     // A lingering "resets 12:20am" line whose time already passed would make
