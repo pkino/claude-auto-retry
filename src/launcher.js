@@ -144,6 +144,10 @@ async function createTmuxSession(args) {
     const envArgs = [];
     for (const [k, v] of Object.entries(process.env)) {
       if (k.startsWith('TMUX')) continue;
+      // 二重ラップ防止フラグを tmux セッション環境に焼き付けない。
+      // 焼き付くと新規ペインの claude が常にラッパーのバイパス分岐に入り、
+      // monitor がフォークされなくなる（監視が効かなくなる）。
+      if (k === 'CLAUDE_AUTO_RETRY_ACTIVE') continue;
       if (v == null) continue;
       envArgs.push('-e', `${k}=${v}`);
     }
@@ -161,12 +165,21 @@ async function createTmuxSession(args) {
     newSessionArgs = ['new-session', '-d', '-s', sessionName, fullCmd];
   }
 
+  // tmux サーバーがまだ無い場合、起動元プロセスの環境をグローバル環境として
+  // 取り込む。CLAUDE_AUTO_RETRY_ACTIVE が含まれていると以後そのサーバー上の
+  // 全ペインに伝播し、ラッパーが常にバイパス分岐へ入って monitor が付かなくなる。
+  // -e 伝播の除外（上の envArgs）だけでは塞げないこの経路を、起動環境からの
+  // 削除で塞ぐ。
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.CLAUDE_AUTO_RETRY_ACTIVE;
+
   try {
-    execFileSync('tmux', newSessionArgs);
+    execFileSync('tmux', newSessionArgs, { env: cleanEnv });
 
     // Attach to the session
     const attachResult = spawn('tmux', ['attach-session', '-t', sessionName], {
       stdio: 'inherit',
+      env: cleanEnv,
     });
 
     return new Promise((resolve) => {
