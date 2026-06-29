@@ -13,11 +13,22 @@ const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'den
 // Claude Code's whimsical spinner verbs, "thinking" states, and live token
 // counters. (busy verb/token patterns adapted from PR #17)
 function isClaudeBusy(text) {
+  // IMPORTANT: distinguish the LIVE spinner from Claude Code's COMPLETION marker.
+  //   live:     "✻ Warping… (20s · ↓ 771 tokens)"   (verb + "…" ellipsis / token counter)
+  //   complete: "✻ Brewed for 1m 56s"                (past-tense verb + "for <duration>")
+  // The completion marker lingers at the bottom of the pane after work finishes.
+  // The previous bare verb list matched "Brewed" (a past-tense word that is BOTH
+  // an active-spinner entry and the completion verb), so a pane that finished on
+  // a "Brewed" completion read as permanently busy — which suppressed rate-limit
+  // detection forever and stopped that pane from ever auto-retrying. We therefore
+  // anchor the spinner match on the live-only signals: the trailing "…" ellipsis,
+  // a "(… tokens)" counter, or the "esc to interrupt" hint. None of these appear
+  // in the completion marker.
   return /esc to interrupt/i.test(text)
-    || /\b(?:Herding|Booping|Cooking|Brewing|Brewed|Sautéing|Sauteing|Simmering|Percolating|Conjuring|Forging|Noodling|Pondering)\b/i.test(text)
+    || /\p{L}+ing…/u.test(text)                  // live spinner verb + ellipsis: "Herding…", "Sautéing…", "Warping…"
     || /still thinking/i.test(text)
     || /thinking (?:with|more|hard|.*effort)/i.test(text)
-    || /\([^)]*tokens\)/i.test(text);
+    || /\([^)]*tokens\)/i.test(text);            // live token/timer counter
 }
 
 // Claude Code's newer interactive /rate-limit-options menu. Pressing Enter here

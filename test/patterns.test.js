@@ -63,6 +63,21 @@ describe('isRateLimited', () => {
   it('detects "usage limit · resets in: 3 hours"', () => {
     assert.equal(isRateLimited('usage limit · resets in: 3 hours'), true);
   });
+  it('detects "used 100% of your session limit" (current Claude Code message)', () => {
+    assert.equal(
+      isRateLimited("You've used 100% of your session limit · resets 12:10am (Asia/Tokyo) · /upgrade to keep using Claude Code"),
+      true
+    );
+  });
+  it('ignores a weekly-limit warning with no same-day reset time', () => {
+    // "resets Jul 4, 6am" has no parseable HH(:MM) right after "resets", so no
+    // RESET pattern matches nearby — a sub-100% weekly heads-up must NOT be
+    // treated as a hard block (otherwise the monitor would wait for days).
+    assert.equal(
+      isRateLimited("You've used 89% of your weekly limit · resets Jul 4, 6am (Asia/Tokyo) · try /model sonnet"),
+      false
+    );
+  });
 });
 
 describe('stripAnsi (private-mode sequences)', () => {
